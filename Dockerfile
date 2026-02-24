@@ -1,4 +1,3 @@
-# 1. Construcción
 FROM node:20 AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y python3 make g++
@@ -7,7 +6,6 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-# 2. Ejecución
 FROM node:20-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y libsqlite3-dev python3 make g++ && rm -rf /var/lib/apt/lists/*
