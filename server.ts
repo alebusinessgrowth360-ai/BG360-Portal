@@ -1,90 +1,127 @@
 import express from "express";
+import { createServer as createViteServer } from "vite";
 import Database from 'better-sqlite3';
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { fileURLToPath } from "url";
+import multer from "multer";
+import { GoogleGenAI } from "@google/genai";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Inicialización de la Base de Datos
 const db = new Database('stacking.db');
 db.pragma('foreign_keys = ON');
 
-console.log("🛠️ Actualizando base de datos para incluir Burós...");
+// --- INICIALIZACIÓN Y MIGRACIÓN DE BASE DE DATOS ---
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE, password TEXT, role TEXT, name TEXT);
+  CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, firstName TEXT, lastName TEXT, phone TEXT, email TEXT, stage TEXT DEFAULT 'NUEVO', createdAt DATETIME DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS credit_snapshots (id TEXT PRIMARY KEY, clientId TEXT, score INTEGER, utilization INTEGER, inquiries6m INTEGER, latePayments12m INTEGER, monthlyIncome REAL, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS bank_products (id TEXT PRIMARY KEY, name TEXT, type TEXT, minScore INTEGER, maxUtilization INTEGER, bureau TEXT DEFAULT 'Experian', link TEXT, active BOOLEAN DEFAULT 1);
+  CREATE TABLE IF NOT EXISTS stacking_plans (id TEXT PRIMARY KEY, clientId TEXT, route TEXT, readinessScore INTEGER, status TEXT DEFAULT 'ACTIVO', createdAt DATETIME DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS plan_items (id TEXT PRIMARY KEY, planId TEXT, productId TEXT, status TEXT DEFAULT 'PENDIENTE', approvedAmount REAL, scheduledDate DATETIME);
+`);
 
-// --- ACTUALIZACIÓN DE TABLAS ---
+// Verificar si falta la columna bureau (por si la DB es vieja)
 try {
-  // Asegurar tablas básicas
-  db.prepare(`CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, firstName TEXT, lastName TEXT, phone TEXT, email TEXT, stage TEXT DEFAULT 'NUEVO', createdAt DATETIME DEFAULT CURRENT_TIMESTAMP)`).run();
-  db.prepare(`CREATE TABLE IF NOT EXISTS credit_snapshots (id TEXT PRIMARY KEY, clientId TEXT, score INTEGER, utilization INTEGER, inquiries INTEGER, income REAL, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP)`).run();
-  db.prepare(`CREATE TABLE IF NOT EXISTS bank_products (id TEXT PRIMARY KEY, name TEXT, type TEXT, minScore INTEGER, maxUtilization INTEGER, link TEXT, active BOOLEAN DEFAULT 1)`).run();
-
-  // Añadir columna 'bureau' si no existe
-  const tableInfo = db.prepare("PRAGMA table_info(bank_products)").all();
-  const hasBureau = tableInfo.some((col: any) => col.name === 'bureau');
-  if (!hasBureau) {
+  const info = db.prepare("PRAGMA table_info(bank_products)").all();
+  if (!info.some((c: any) => c.name === 'bureau')) {
     db.prepare("ALTER TABLE bank_products ADD COLUMN bureau TEXT DEFAULT 'Experian'").run();
-    console.log("🚀 Columna 'bureau' añadida con éxito.");
   }
-} catch (err) { console.error("Error actualizando DB:", err); }
+} catch (e) {}
 
-// --- RE-CARGAR BANCOS CON SUS BURÓS REALES ---
-try {
-  db.prepare('DELETE FROM bank_products').run();
-  const insert = db.prepare('INSERT INTO bank_products (id, name, type, minScore, maxUtilization, bureau, link) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  const initialBanks = [
-    ['Chase Business Ink', 'Business', 720, 30, 'Experian', 'https://chase.com'],
-    ['Amex Blue Business Plus', 'Business', 700, 40, 'Experian', 'https://americanexpress.com'],
-    ['BofA Business Advantage', 'Business', 680, 35, 'TransUnion', 'https://bofa.com'],
-    ['Discover IT Cash Back', 'Personal', 670, 30, 'Equifax', 'https://discover.com'],
-    ['Wells Fargo Reflect', 'Personal', 700, 25, 'Experian', 'https://wellsfargo.com']
-  ];
-  initialBanks.forEach(b => insert.run(uuidv4(), ...b));
-  console.log("🏦 Bancos actualizados con Burós.");
-} catch (err) { console.error(err); }
-
+// --- API ROUTES ---
 async function startServer() {
   const app = express();
+  const upload = multer({ storage: multer.memoryStorage() });
+  const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
   app.use(express.json());
 
-  // API: Listar Clientes
-  app.get("/api/clients", (req, res) => {
-    const clients = db.prepare(`
-      SELECT c.*, s.score 
-      FROM clients c 
-      LEFT JOIN credit_snapshots s ON c.id = s.clientId 
-      ORDER BY c.createdAt DESC
-    `).all();
-    res.json(clients);
+  // Auth
+  app.post("/api/auth/login", (req, res) => {
+    const { email, password } = req.body;
+    if (email === 'admin@bg360.com' && password === 'admin123') {
+      res.json({ id: '1', email, role: 'ADMIN', name: 'Admin BG360' });
+    } else {
+      res.status(401).json({ error: "Error" });
+    }
   });
-  
-  // API: Detalles de Cliente (Corregido)
+
+  // Clientes
+  app.get("/api/clients", (req, res) => {
+    res.json(db.prepare(`SELECT c.*, s.score, s.utilization FROM clients c LEFT JOIN credit_snapshots s ON c.id = s.clientId GROUP BY c.id ORDER BY c.createdAt DESC`).all());
+  });
+
   app.get("/api/clients/:id", (req, res) => {
     const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(req.params.id);
     const snapshot = db.prepare('SELECT * FROM credit_snapshots WHERE clientId = ? ORDER BY updatedAt DESC LIMIT 1').get(req.params.id);
-    res.json({ client, snapshot });
+    const plan = db.prepare('SELECT * FROM stacking_plans WHERE clientId = ?').get(req.params.id);
+    const items = plan ? db.prepare('SELECT pi.*, bp.name as productName, bp.bureau FROM plan_items pi JOIN bank_products bp ON pi.productId = bp.id WHERE pi.planId = ?').all(plan.id) : [];
+    res.json({ client, snapshot, plan, items });
   });
 
-  // API: Crear Cliente
   app.post("/api/clients", (req, res) => {
-    const { firstName, lastName, phone, email, score, utilization, income } = req.body;
-    const clientId = uuidv4();
-    db.prepare('INSERT INTO clients (id, firstName, lastName, phone, email) VALUES (?, ?, ?, ?, ?)').run(clientId, firstName, lastName, phone, email);
-    db.prepare('INSERT INTO credit_snapshots (id, clientId, score, utilization, income) VALUES (?, ?, ?, ?, ?)').run(uuidv4(), clientId, score, utilization, income);
-    res.json({ id: clientId });
+    const id = uuidv4();
+    const { firstName, lastName, email, phone } = req.body;
+    db.prepare('INSERT INTO clients (id, firstName, lastName, email, phone) VALUES (?, ?, ?, ?, ?)').run(id, firstName, lastName, email, phone);
+    res.json({ id });
   });
 
-  // API: Listar Bancos
-  app.get("/api/banks", (req, res) => {
-    res.json(db.prepare('SELECT * FROM bank_products WHERE active = 1').all());
+  // IA: Analizar PDF
+  app.post("/api/clients/:id/upload-report", upload.single('report'), async (req, res) => {
+    if (!req.file) return res.status(400).send("No file");
+    try {
+      const model = genAI.models.generateContent({
+        model: "gemini-1.5-flash",
+        contents: [{ role: "user", parts: [
+          { inlineData: { mimeType: "application/pdf", data: req.file.buffer.toString('base64') } },
+          { text: "Extrae en JSON: score, utilization, inquiries6m, latePayments12m, monthlyIncome. Solo el JSON." }
+        ]}]
+      });
+      const result = await model;
+      const data = JSON.parse(result.text.match(/\{.*\}/s)![0]);
+      db.prepare('INSERT INTO credit_snapshots (id, clientId, score, utilization, inquiries6m, latePayments12m, monthlyIncome) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(uuidv4(), req.params.id, data.score, data.utilization, data.inquiries6m, data.latePayments12m, data.monthlyIncome);
+      res.json(data);
+    } catch (e) { res.status(500).send("Error IA"); }
   });
 
-  // Servir Frontend
-  app.use(express.static(path.join(__dirname, "dist")));
-  app.get("*", (req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
+  // Bancos
+  app.get("/api/banks", (req, res) => res.json(db.prepare('SELECT * FROM bank_products').all()));
+  app.post("/api/banks", (req, res) => {
+    const { name, type, minScore, maxUtilization, bureau, link } = req.body;
+    db.prepare('INSERT INTO bank_products (id, name, type, minScore, maxUtilization, bureau, link) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(uuidv4(), name, type, minScore, maxUtilization, bureau, link);
+    res.json({ success: true });
+  });
 
-  app.listen(3000, "0.0.0.0", () => console.log(`🚀 Ready`));
+  // Stacking
+  app.post("/api/clients/:id/generate-plan", (req, res) => {
+    const snap = db.prepare('SELECT * FROM credit_snapshots WHERE clientId = ? ORDER BY updatedAt DESC LIMIT 1').get(req.params.id) as any;
+    const planId = uuidv4();
+    db.prepare('INSERT INTO stacking_plans (id, clientId, route, readinessScore) VALUES (?, ?, ?, ?)')
+      .run(planId, req.params.id, snap.score > 700 ? 'RUTA_A' : 'RUTA_B', 85);
+    
+    const banks = db.prepare('SELECT * FROM bank_products WHERE minScore <= ? LIMIT 5').all(snap.score) as any[];
+    banks.forEach(b => {
+      db.prepare('INSERT INTO plan_items (id, planId, productId, approvedAmount, scheduledDate) VALUES (?, ?, ?, ?, ?)')
+        .run(uuidv4(), planId, b.id, 15000, new Date().toISOString());
+    });
+    res.json({ success: true });
+  });
+
+  app.put("/api/plan-items/:id", (req, res) => {
+    db.prepare('UPDATE plan_items SET status = ?, approvedAmount = ? WHERE id = ?').run(req.body.status, req.body.approvedAmount, req.params.id);
+    res.json({ success: true });
+  });
+
+  if (process.env.NODE_ENV === "production") {
+    app.use(express.static(path.join(__dirname, "dist")));
+    app.get("*", (req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
+  } else {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+    app.use(vite.middlewares);
+  }
+  app.listen(3000, "0.0.0.0", () => console.log(`🚀 Portal BG360 Online`));
 }
-
 startServer();
