@@ -12,7 +12,7 @@ const __dirname = path.dirname(__filename);
 const db = new Database('stacking.db');
 db.pragma('foreign_keys = ON');
 
-// --- INICIALIZACIÓN Y MIGRACIÓN DE BASE DE DATOS ---
+// --- BASE DE DATOS ---
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE, password TEXT, role TEXT, name TEXT);
   CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, firstName TEXT, lastName TEXT, phone TEXT, email TEXT, stage TEXT DEFAULT 'NUEVO', createdAt DATETIME DEFAULT CURRENT_TIMESTAMP);
@@ -22,7 +22,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS plan_items (id TEXT PRIMARY KEY, planId TEXT, productId TEXT, status TEXT DEFAULT 'PENDIENTE', approvedAmount REAL, scheduledDate DATETIME);
 `);
 
-// Verificar si falta la columna bureau (por si la DB es vieja)
+// Migración automática de Buró
 try {
   const info = db.prepare("PRAGMA table_info(bank_products)").all();
   if (!info.some((c: any) => c.name === 'bureau')) {
@@ -30,7 +30,6 @@ try {
   }
 } catch (e) {}
 
-// --- API ROUTES ---
 async function startServer() {
   const app = express();
   const upload = multer({ storage: multer.memoryStorage() });
@@ -63,7 +62,7 @@ async function startServer() {
   app.post("/api/clients", (req, res) => {
     const id = uuidv4();
     const { firstName, lastName, email, phone } = req.body;
-    db.prepare('INSERT INTO clients (id, firstName, lastName, email, phone) VALUES (?, ?, ?, ?, ?)').run(id, firstName, lastName, email, phone);
+    db.prepare('INSERT INTO clients (id, firstName, lastName, email, phone) VALUES (?, ?, ?, ?, ?)').run(id, firstName, lastName, phone, email);
     res.json({ id });
   });
 
@@ -75,7 +74,7 @@ async function startServer() {
         model: "gemini-1.5-flash",
         contents: [{ role: "user", parts: [
           { inlineData: { mimeType: "application/pdf", data: req.file.buffer.toString('base64') } },
-          { text: "Extrae en JSON: score, utilization, inquiries6m, latePayments12m, monthlyIncome. Solo el JSON." }
+          { text: "Analiza el reporte y extrae en JSON: score, utilization, inquiries6m, latePayments12m, monthlyIncome. Solo el JSON." }
         ]}]
       });
       const result = await model;
@@ -98,6 +97,7 @@ async function startServer() {
   // Stacking
   app.post("/api/clients/:id/generate-plan", (req, res) => {
     const snap = db.prepare('SELECT * FROM credit_snapshots WHERE clientId = ? ORDER BY updatedAt DESC LIMIT 1').get(req.params.id) as any;
+    if (!snap) return res.status(400).send("No data");
     const planId = uuidv4();
     db.prepare('INSERT INTO stacking_plans (id, clientId, route, readinessScore) VALUES (?, ?, ?, ?)')
       .run(planId, req.params.id, snap.score > 700 ? 'RUTA_A' : 'RUTA_B', 85);
@@ -105,7 +105,7 @@ async function startServer() {
     const banks = db.prepare('SELECT * FROM bank_products WHERE minScore <= ? LIMIT 5').all(snap.score) as any[];
     banks.forEach(b => {
       db.prepare('INSERT INTO plan_items (id, planId, productId, approvedAmount, scheduledDate) VALUES (?, ?, ?, ?, ?)')
-        .run(uuidv4(), planId, b.id, 15000, new Date().toISOString());
+        .run(uuidv4(), planId, b.id, 10000, new Date().toISOString());
     });
     res.json({ success: true });
   });
