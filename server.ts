@@ -33,7 +33,6 @@ try {
 async function startServer() {
   const app = express();
   const upload = multer({ storage: multer.memoryStorage() });
-  const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
   app.use(express.json());
 
   // Auth
@@ -62,14 +61,21 @@ async function startServer() {
   app.post("/api/clients", (req, res) => {
     const id = uuidv4();
     const { firstName, lastName, email, phone } = req.body;
-    db.prepare('INSERT INTO clients (id, firstName, lastName, email, phone) VALUES (?, ?, ?, ?, ?)').run(id, firstName, lastName, phone, email);
+    db.prepare('INSERT INTO clients (id, firstName, lastName, email, phone) VALUES (?, ?, ?, ?, ?)').run(id, firstName, lastName, email, phone);
     res.json({ id });
   });
 
-  // IA: Analizar PDF
+  // IA: Analizar PDF (Inicialización perezosa para evitar crash)
   app.post("/api/clients/:id/upload-report", upload.single('report'), async (req, res) => {
     if (!req.file) return res.status(400).send("No file");
+    
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "Falta configurar GEMINI_API_KEY en Easypanel" });
+    }
+
     try {
+      const genAI = new GoogleGenAI({ apiKey });
       const model = genAI.models.generateContent({
         model: "gemini-1.5-flash",
         contents: [{ role: "user", parts: [
@@ -82,7 +88,10 @@ async function startServer() {
       db.prepare('INSERT INTO credit_snapshots (id, clientId, score, utilization, inquiries6m, latePayments12m, monthlyIncome) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(uuidv4(), req.params.id, data.score, data.utilization, data.inquiries6m, data.latePayments12m, data.monthlyIncome);
       res.json(data);
-    } catch (e) { res.status(500).send("Error IA"); }
+    } catch (e) { 
+      console.error(e);
+      res.status(500).send("Error procesando con IA"); 
+    }
   });
 
   // Bancos
@@ -97,7 +106,7 @@ async function startServer() {
   // Stacking
   app.post("/api/clients/:id/generate-plan", (req, res) => {
     const snap = db.prepare('SELECT * FROM credit_snapshots WHERE clientId = ? ORDER BY updatedAt DESC LIMIT 1').get(req.params.id) as any;
-    if (!snap) return res.status(400).send("No data");
+    if (!snap) return res.status(400).send("No hay datos del cliente");
     const planId = uuidv4();
     db.prepare('INSERT INTO stacking_plans (id, clientId, route, readinessScore) VALUES (?, ?, ?, ?)')
       .run(planId, req.params.id, snap.score > 700 ? 'RUTA_A' : 'RUTA_B', 85);
